@@ -1,0 +1,860 @@
+package layer1;
+
+import java.net.HttpCookie;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyManagementException;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.SSLContext;
+
+import org.apache.http.Header;
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpHeaders;
+import org.apache.http.HttpRequest;
+import org.apache.http.HttpResponse;
+import org.apache.http.HttpStatus;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpPut;
+import org.apache.http.client.utils.URIBuilder;
+import org.apache.http.config.Registry;
+import org.apache.http.config.RegistryBuilder;
+import org.apache.http.conn.HttpClientConnectionManager;
+import org.apache.http.conn.socket.ConnectionSocketFactory;
+import org.apache.http.conn.socket.PlainConnectionSocketFactory;
+import org.apache.http.conn.ssl.NoopHostnameVerifier;
+import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.DefaultHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.ssl.SSLContextBuilder;
+import org.apache.http.util.EntityUtils;
+import org.apache.log4j.Logger;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.util.OpsHubHttpUtils;
+
+
+public class Layer1 {
+
+	private static final String XSRF_TOKEN = "XSRF-TOKEN";
+	private static final String X_XSRF_TOKEN = "X-XSRF-TOKEN";
+	private static final String JSESSION_ID_KEY = "JSESSIONID";
+	private static final String COOKIE_KEY = "Cookie";
+	private static final String SET_COOKIE_KEY = "Set-Cookie";
+	private static final String SYSTEM_LIST_KEY = "systemList";
+	private static final String BASIC_AUTH_KEY = "BasicAuthorization";
+	private static final String CONTENT_TYPE_KEY = "Content-Type";
+	private static final String APPLICATION_URL_ECNODED = "application/X-www-form-urlencoded";
+	private static final String APPLICATION_JSON = "application/json";
+	private static final String LOGIN_API = "/OpsHubWS/queryNode/user/basicLogin";
+	private static final String GRAPHQL_API = "/OpsHubWS/queryNode/executeQuery";
+	private static final String QUERY_KEY = "query";
+
+	private static final String DISPLAY_NAME = "displayName";
+	private static final String INTERNAL_NAME = "internalName";
+
+	private static HttpClient httpClient = new DefaultHttpClient();
+
+	public static String xsrfTokenValue = null;
+	public static String jsessionIdValue = null;
+
+	private static HashMap<String, HashMap<String, String>> projectIssueTypeMap = new HashMap<>();
+
+	private static final Logger LOGGER = Logger.getLogger(Layer1.class);
+
+	public static HttpResponse loginAndSetValues(String url, String username, String password) throws Exception {
+		// TODO: Restructure this method
+		LOGGER.debug("Performing login...");
+		HttpResponse response = null;
+		HttpPost httpPost = null;
+		try {
+			String auth = username + ":" + password;
+			byte[] encodedAuth = Base64.getEncoder().encode(auth.getBytes(StandardCharsets.ISO_8859_1));
+			String authHeader = "Basic " + new String(encodedAuth);
+			LOGGER.debug("Generated BasicAuthentication: " + authHeader);
+
+			httpPost = new HttpPost(url + LOGIN_API);
+			httpPost.setHeader(BASIC_AUTH_KEY, authHeader);
+			httpPost.setHeader(HttpHeaders.CONTENT_TYPE, APPLICATION_URL_ECNODED);
+			response = httpClient.execute(httpPost);
+			LOGGER.debug("Response ="+response);
+			if (response != null && response.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
+				LOGGER.debug("Login successful");
+				Header[] headers = response.getHeaders(SET_COOKIE_KEY);
+				if (headers == null) {
+					throw new Exception(
+							"Could not find any headers in login response. Make sure url and credentials are correctly provided");
+				}
+				for (Header header : headers) {
+					xsrfTokenValue = OpsHubHttpUtils.getXSRFTokenValue(header.getValue());
+					if (xsrfTokenValue != null && !xsrfTokenValue.isEmpty()) {
+						LOGGER.debug("Found XSRF Token Value:" + xsrfTokenValue);
+						break;
+					}
+				}
+				for (Header header : headers) {
+					List<HttpCookie> cookies = HttpCookie.parse(header.getValue());
+					for (HttpCookie cookie : cookies) {
+						if (cookie.getName().equalsIgnoreCase(JSESSION_ID_KEY)) {
+							jsessionIdValue = cookie.getValue();
+							if (jsessionIdValue != null && !jsessionIdValue.isEmpty()) {
+								LOGGER.debug("Found JSESSION-ID Value:" + jsessionIdValue);
+								break;
+							}
+						}
+					}
+				}
+			}
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while login. Caused By: " + e.getMessage());
+			throw new Exception("Error occurred while login. Caused by: " + e.getMessage());
+		} finally {
+			if (httpPost != null)
+				httpPost.releaseConnection();
+		}
+		return response;
+	}
+
+	public static String getXSRFToken(String url, String username, String password) throws Exception {
+		if (xsrfTokenValue != null) {
+			LOGGER.debug("Returning XSRF token value:" + xsrfTokenValue);
+			return xsrfTokenValue;
+		}
+		LOGGER.debug("Getting XSRF token value from login response.");
+		Layer1.loginAndSetValues(url, username, password);
+		return xsrfTokenValue;
+	}
+
+	public static String getJsessionId(String url, String username, String password) throws Exception {
+		if (jsessionIdValue != null) {
+			LOGGER.debug("Returning jsession id value:" + jsessionIdValue);
+			return jsessionIdValue;
+		}
+		LOGGER.debug("Getting jsession id value from login response.");
+		Layer1.loginAndSetValues(url, username, password);
+		return jsessionIdValue;
+	}
+
+	private static HashMap<String, HashMap<String, Integer>> cachedSystemName;
+
+	public static Integer getSystemIdFromName(String systemName, String url, String username, String password)
+			throws Exception {
+		Integer systemId = null;
+		try {
+
+			if (cachedSystemName != null) {
+				HashMap<String, Integer> cachedPodSystemName = cachedSystemName.get(url);
+				if (cachedPodSystemName != null && cachedPodSystemName.containsKey(systemName)) {
+					LOGGER.debug("Returning system id:" + cachedPodSystemName.get(systemName) + " for System:"
+							+ systemName + " from cache.");
+					return cachedPodSystemName.get(systemName);
+				}
+			}
+			LOGGER.debug("Getting system id for system:" + systemName);
+			HashMap<String, String> parameters = new HashMap<>();
+			parameters.put(QUERY_KEY, "{systemList(searchText:\"" + systemName
+					+ "\",pager : { pageSize :2000,recordNumber : 0 }){list{id,name}}}");
+			String response = sendGetRequest(url + GRAPHQL_API, parameters, getCommonHeaders(url, username, password));
+
+			if (response != null) {
+				JSONObject responseJSON = new JSONObject(response);
+				JSONArray array = responseJSON.getJSONObject(SYSTEM_LIST_KEY).getJSONArray("list");
+				// traverse the array
+				// if the name is exactly the same
+				for (int i = 0; i < array.length(); ++i) {
+					String foundSystemName = array.getJSONObject(i).getString("name");
+					if (foundSystemName.equalsIgnoreCase(systemName)) {
+						systemId = array.getJSONObject(i).getInt("id");
+						LOGGER.debug("Found system id:" + systemId);
+						if (cachedSystemName == null) {
+							cachedSystemName = new HashMap<>();
+						}
+						HashMap<String, Integer> cachedSystemNamePodWise = cachedSystemName.get(url);
+						if (cachedSystemNamePodWise == null) {
+							cachedSystemNamePodWise = new HashMap<>();
+						}
+						cachedSystemNamePodWise.put(systemName, systemId);
+						cachedSystemName.put(url, cachedSystemNamePodWise);
+
+					}
+				}
+			} else {
+				LOGGER.error("Response is null. Could not fetch system id for " + systemName);
+				throw new Exception("Could not fetch system id for " + systemName);
+			}
+
+		} catch (Exception e) {
+			LOGGER.error(
+					"Exception occurred while fetching sytem id for " + systemName + " caused by: " + e.getMessage());
+			throw new Exception("Could not fetch system id for " + systemName);
+		}
+		return systemId;
+
+	}
+
+	public static HttpClient getJiraHttpClient() {
+		HttpClientBuilder httpClientBuilder = HttpClientBuilder.create();
+		Registry<ConnectionSocketFactory> socketFactoryRegistry = null;
+		try {
+			final SSLContext sslContext = new SSLContextBuilder()
+					.loadTrustMaterial(null, (x509CertChain, authType) -> true).build();
+
+			// SSLConnectionSocketFactory trustSelfSignedSocketFactory = new
+			// SSLConnectionSocketFactory(
+			// new SSLContextBuilder().loadTrustMaterial(null, new
+			// TrustSelfSignedStrategy()).build(),
+			// new TrustAllHostNameVerifier());
+			socketFactoryRegistry = RegistryBuilder.<ConnectionSocketFactory>create()
+					.register("http", new PlainConnectionSocketFactory())
+					.register("https", new SSLConnectionSocketFactory(sslContext, NoopHostnameVerifier.INSTANCE))
+					.build();
+			LOGGER.info("socketFactoryRegistry initialized successfully");
+		} catch (KeyManagementException | NoSuchAlgorithmException | KeyStoreException e) {
+			LOGGER.error("Error in initlializing socketFactoryRegistry :" + e.getMessage());
+		}
+
+		HttpClientConnectionManager poolingConnManager = new PoolingHttpClientConnectionManager(socketFactoryRegistry);
+		// HttpClientConnectionManager poolingConnManager = new
+		// PoolingHttpClientConnectionManager();
+		LOGGER.info("poolingConnManager initialized successfully");
+		poolingConnManager.closeIdleConnections(1, TimeUnit.MINUTES);
+
+		/* Set socket/connection timeout configurations */
+		RequestConfig config = RequestConfig.custom().build();
+		httpClientBuilder.setDefaultRequestConfig(config);
+		httpClientBuilder.setConnectionManager(poolingConnManager);
+		// to bypass ssl certification validation
+		httpClientBuilder.setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE);
+		return httpClientBuilder.build();
+	}
+	
+	public static HttpClient getADOHttpClient() {
+		HttpClientBuilder httpClientBuilder = HttpClientBuilder.create();
+		Registry<ConnectionSocketFactory> socketFactoryRegistry = null;
+		try {
+			final SSLContext sslContext = new SSLContextBuilder()
+					.loadTrustMaterial(null, (x509CertChain, authType) -> true).build();
+
+			// SSLConnectionSocketFactory trustSelfSignedSocketFactory = new
+			// SSLConnectionSocketFactory(
+			// new SSLContextBuilder().loadTrustMaterial(null, new
+			// TrustSelfSignedStrategy()).build(),
+			// new TrustAllHostNameVerifier());
+			socketFactoryRegistry = RegistryBuilder.<ConnectionSocketFactory>create()
+					.register("http", new PlainConnectionSocketFactory())
+					.register("https", new SSLConnectionSocketFactory(sslContext, NoopHostnameVerifier.INSTANCE))
+					.build();
+			LOGGER.info("socketFactoryRegistry initialized successfully");
+		} catch (KeyManagementException | NoSuchAlgorithmException | KeyStoreException e) {
+			LOGGER.error("Error in initlializing socketFactoryRegistry :" + e.getMessage());
+		}
+
+		HttpClientConnectionManager poolingConnManager = new PoolingHttpClientConnectionManager(socketFactoryRegistry);
+		// HttpClientConnectionManager poolingConnManager = new
+		// PoolingHttpClientConnectionManager();
+		LOGGER.info("poolingConnManager initialized successfully");
+		poolingConnManager.closeIdleConnections(1, TimeUnit.MINUTES);
+
+		/* Set socket/connection timeout configurations */
+		RequestConfig config = RequestConfig.custom().build();
+		httpClientBuilder.setDefaultRequestConfig(config);
+		httpClientBuilder.setConnectionManager(poolingConnManager);
+		// to bypass ssl certification validation
+		httpClientBuilder.setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE);
+		return httpClientBuilder.build();
+	}
+
+	public static String sendJiraRequest(final String url, final HashMap<String, String> parameters,
+			final HashMap<String, String> headers) {
+		LOGGER.debug("Sending GET request. URL:" + url);
+		LOGGER.debug("Query Parameter String:" + ((parameters != null) ? parameters.toString() : "null"));
+		LOGGER.debug("Headers: " + ((headers != null) ? headers.toString() : "null"));
+		HttpResponse response = null;
+		HttpGet httpGet = null;
+		String responseString = null;
+		try {
+			URIBuilder builder = new URIBuilder(url);
+			setParameters(builder, parameters);
+			httpGet = new HttpGet(builder.build());
+			setHeader(httpGet, headers);
+			HttpClient client = getJiraHttpClient();
+			LOGGER.debug("Returned client, Now executing get request..");
+			response = client.execute(httpGet);
+			LOGGER.debug("Executed GET request");
+			if (response != null) {
+				LOGGER.debug("Response Code:" + response.getStatusLine().getStatusCode());
+				HttpEntity httpEntity = response.getEntity();
+				if (httpEntity == null) {
+					LOGGER.debug("HttpEntity in response is null");
+				} else {
+					responseString = EntityUtils.toString(httpEntity);
+					LOGGER.debug("Response Body:" + responseString);
+				}
+			} else {
+				LOGGER.debug("Response is null");
+			}
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while sending GET request. Caused By:" + e + " Message" + e.getMessage());
+		} finally {
+			if (httpGet != null) {
+				httpGet.releaseConnection();
+			}
+		}
+		return responseString;
+	}
+
+	public static String sendADORequest(final String url, final HashMap<String, String> parameters,
+			final HashMap<String, String> headers) {
+		LOGGER.debug("Sending GET request. URL:" + url);
+		LOGGER.debug("Query Parameter String:" + ((parameters != null) ? parameters.toString() : "null"));
+		LOGGER.debug("Headers: " + ((headers != null) ? headers.toString() : "null"));
+		HttpResponse response = null;
+		HttpGet httpGet = null;
+		String responseString = null;
+		try {
+			URIBuilder builder = new URIBuilder(url);
+			setParameters(builder, parameters);
+			httpGet = new HttpGet(builder.build());
+			setHeader(httpGet, headers);
+			HttpClient client = getADOHttpClient();
+			LOGGER.debug("Returned client, Now executing get request..");
+			response = client.execute(httpGet);
+			LOGGER.debug("Executed GET request");
+			if (response != null) {
+				LOGGER.debug("Response Code:" + response.getStatusLine().getStatusCode());
+				HttpEntity httpEntity = response.getEntity();
+				if (httpEntity == null) {
+					LOGGER.debug("HttpEntity in response is null");
+				} else {
+					responseString = EntityUtils.toString(httpEntity);
+					LOGGER.debug("Response Body:" + responseString);
+				}
+			} else {
+				LOGGER.debug("Response is null");
+			}
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while sending GET request. Caused By:" + e + " Message" + e.getMessage());
+		} finally {
+			if (httpGet != null) {
+				httpGet.releaseConnection();
+			}
+		}
+		return responseString;
+	}
+	private static HashMap<String, HashMap<String, Integer>> cachedMappingName;
+
+	public static Integer getMappingIdFromName(String mappingName, String url, String username, String password)
+			throws Exception {
+		Integer mappingId = null;
+		try {
+
+			if (cachedMappingName != null) {
+				HashMap<String, Integer> cachedPodWiseMapping = cachedMappingName.get(url);
+				if (cachedPodWiseMapping != null && cachedPodWiseMapping.containsKey(mappingName)) {
+					LOGGER.debug("Returning mapping id:" + cachedPodWiseMapping.get(mappingName) + " for mapping name:"
+							+ mappingName + " from cache.");
+					return cachedPodWiseMapping.get(mappingName);
+				}
+			}
+			LOGGER.debug("Getting mapping id for mapping name:" + mappingName);
+			HashMap<String, String> parameters = new HashMap<>();
+			parameters.put(QUERY_KEY, "{mapperList(searchText:\"" + mappingName
+					+ "\",pager : { pageSize : 1000,recordNumber:0 }){list{mappingId,mappingName}}}");
+			String response = sendGetRequest(url + GRAPHQL_API, parameters, getCommonHeaders(url, username, password));
+
+			if (response != null || !response.isEmpty()) {
+				JSONObject responseJSON = new JSONObject(response);
+				JSONArray array = responseJSON.getJSONObject("mapperList").getJSONArray("list");
+				for (int i = 0; i < array.length(); ++i) {
+					String foundMappingName = array.getJSONObject(i).getString("mappingName");
+					if (foundMappingName.equalsIgnoreCase(mappingName)) {
+						mappingId = array.getJSONObject(i).getInt("mappingId");
+						LOGGER.debug("Found mapping id:" + mappingId);
+						if (cachedMappingName == null) {
+							cachedMappingName = new HashMap<>();
+						}
+						HashMap<String, Integer> podwiseMapping = cachedMappingName.get(url);
+						if (podwiseMapping == null) {
+							podwiseMapping = new HashMap<>();
+						}
+						podwiseMapping.put(mappingName, mappingId);
+						cachedMappingName.put(url, podwiseMapping);
+					}
+				}
+
+				if (mappingId == null) {
+					LOGGER.error("No mapping id found for mapping name: " + mappingName);
+					throw new Exception("Could not find mapping id for: " + mappingName);
+				}
+
+			} else {
+				LOGGER.error("No mapping id found for mapping name: " + mappingName);
+				throw new Exception("Could not find mapping id for: " + mappingName);
+			}
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while getting mapping id from name:" + mappingName + ", Caused by:"
+					+ e.getMessage());
+			throw new Exception("Error occurred while fetching mapping id for: " + mappingName);
+		}
+		return mappingId;
+	}
+
+	public static HashMap<String, String> loadProjectsFromSystemId(String url, int systemId, String username,
+			String password, boolean returnInternalToDisplayMap, boolean isDoorsSystem) throws Exception {
+		LOGGER.debug("Loading projects from system id: " + systemId);
+		// display name to internal name map
+		HashMap<String, String> projectMap = new HashMap<>();
+		try {
+			HashMap<String, String> parameters = new HashMap<>();
+			parameters.put(QUERY_KEY, "{mapperContextInfo(systemId:" + systemId
+					+ ",mappingId:-1){contextList{context{internalName,displayName}}}}");
+			String response = sendGetRequest(url + GRAPHQL_API, parameters, getCommonHeaders(url, username, password));
+			if (response != null) {
+				JSONObject responseJSON = new JSONObject(response);
+				JSONObject mapperContextInfo = responseJSON.getJSONObject("mapperContextInfo");
+				JSONArray contextList = mapperContextInfo.getJSONArray("contextList");
+				if (contextList.length() < 1) {
+					// error
+				} else {
+					JSONObject firstContext;
+					if(isDoorsSystem)
+						 firstContext = contextList.getJSONObject(1);
+					else
+						 firstContext = contextList.getJSONObject(0);
+					JSONArray projectsMeta = firstContext.getJSONArray("context");
+					for (int i = 0; i < projectsMeta.length(); ++i) {
+						JSONObject currentProject = projectsMeta.getJSONObject(i);
+						if (returnInternalToDisplayMap) {
+							projectMap.put(currentProject.getString(INTERNAL_NAME),
+									currentProject.getString(DISPLAY_NAME));
+						} else {
+							projectMap.put(currentProject.getString(DISPLAY_NAME),
+									currentProject.getString(INTERNAL_NAME));
+						}
+
+					}
+				}
+			}
+
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while loading projects for system id: " + systemId + " Caused by: "
+					+ e.getMessage());
+			throw new Exception("Error occurred while loading projects for system id: " + systemId + " Caused by: "
+					+ e.getMessage());
+		}
+		return projectMap;
+	}
+
+	public static String[] getIssueTypeInternalNameFromDisplayName(String url, String projectId, String username,
+			String password, String[] issueTypeNames, Integer systemId) throws Exception {
+		// TODO: Restructure with proper error message
+		LOGGER.debug("Fetching issue type internal names.");
+		String[] issueTypeIds = new String[issueTypeNames.length];
+		HashMap<String, String> issueTypeIdMap = new HashMap<>();
+		try {
+			HashMap<String, String> parameters = new HashMap<>();
+			parameters.put(QUERY_KEY, "query{issueTypes(projectIdList : \"" + projectId + "\",systemId : " + systemId
+					+ "){list{internalName,displayName}}}");
+
+			String response = sendGetRequest(url + GRAPHQL_API, parameters, getCommonHeaders(url, username, password));
+
+			if (response != null && !response.isEmpty()) {
+				JSONObject responseJSON = new JSONObject(response);
+				JSONArray array = responseJSON.getJSONObject("issueTypes").getJSONArray("list");
+				for (int i = 0; i < array.length(); ++i) {
+					JSONObject currentObj = array.getJSONObject(i);
+					issueTypeIdMap.put(currentObj.getString(DISPLAY_NAME), currentObj.getString(INTERNAL_NAME));
+				}
+
+				for (int i = 0; i < issueTypeNames.length; ++i) {
+					if (issueTypeNames[i].equalsIgnoreCase("Feature")) {
+						for (Map.Entry<String, String> entry : issueTypeIdMap.entrySet()) {
+							String key = entry.getKey();
+							if (key.contains("Feature") || key.contains("feature")) {
+								issueTypeIds[i] = issueTypeIdMap.get(key);
+								LOGGER.debug("Found feature. Issue Type:" + key + " Issue Type Id:" + issueTypeIds[i]);
+							}
+						}
+					}
+					if (issueTypeNames[i].equalsIgnoreCase("Initiative")) {
+						for (Map.Entry<String, String> entry : issueTypeIdMap.entrySet()) {
+							String key = entry.getKey();
+							if (key.contains("Initiative") || key.contains("initiative")) {
+								issueTypeIds[i] = issueTypeIdMap.get(key);
+								LOGGER.debug(
+										"Found initiative. Issue Type:" + key + " Issue Type Id:" + issueTypeIds[i]);
+							}
+						}
+					}
+					if (issueTypeNames[i].equalsIgnoreCase("Minimum Business Increment")) {
+						for (Map.Entry<String, String> entry : issueTypeIdMap.entrySet()) {
+							String key = entry.getKey();
+							if (key.contains("Minimum Business Increment")
+									|| key.contains("minimum business increment")) {
+								issueTypeIds[i] = issueTypeIdMap.get(key);
+								LOGGER.debug(
+										"Found initiative. Issue Type:" + key + " Issue Type Id:" + issueTypeIds[i]);
+							}
+						}
+					}
+					if (issueTypeIdMap.containsKey(issueTypeNames[i])) {
+						issueTypeIds[i] = issueTypeIdMap.get(issueTypeNames[i]);
+						LOGGER.debug("Issue type name: " + issueTypeNames[i] + " issue type id: " + issueTypeIds[i]);
+					} else if (issueTypeIds[i] == null) {
+						LOGGER.error("Could not find internal name for issue type: " + issueTypeNames[i] + " for Project Id: "+projectId);
+						throw new Exception("Could not find internal name for issue type: " + issueTypeNames[i]+ " for Project Id: "+projectId);
+					}
+				}
+
+			} else {
+
+			}
+			projectIssueTypeMap.put(projectId, issueTypeIdMap);
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while fetching issue type internal name from display name. " + e.getMessage());
+			throw new Exception("Error occurred while fetching issue type internal name:" + e.getMessage());
+		}
+		return issueTypeIds;
+	}
+
+	public static String createIntegration(String createIntegrationUrl, String username, String password,
+			String requestBody) {
+		String response = null;
+		LOGGER.debug("Sending create integration request.");
+		try {
+			long startTime = System.currentTimeMillis();
+			response = sendPostRequest(createIntegrationUrl + GRAPHQL_API, requestBody,
+					getCommonHeaders(createIntegrationUrl, username, password), APPLICATION_JSON);
+			long endTime = System.currentTimeMillis();
+			LOGGER.debug("Time Taken: " + (endTime - startTime) + " ms");
+
+		} catch (Exception e) {
+			LOGGER.error("Exception occurred while creating integration. Caused By:" + e.getMessage());
+		}
+		return response;
+	}
+
+	public static int createFolder(String url, String folderName, int parentId, String username, String password)
+			throws Exception {
+		// TODO: error handling
+		try {
+			String body = "{\"query\": \"mutation{containers(name:\\\"" + folderName
+					+ "\\\",entityType:\\\"folder\\\",parent:" + parentId + "){id,name}}\"}";
+
+			String response = sendPostRequest(url + GRAPHQL_API, body, getCommonHeaders(url, username, password),
+					APPLICATION_JSON);
+
+			if (response != null && !response.isEmpty()) {
+				JSONObject responseJSON = new JSONObject(response);
+				JSONObject obj = responseJSON.getJSONObject("containers");
+				String createdFolderName = obj.getString("name");
+				if (createdFolderName.equals(folderName)) {
+					return obj.getInt("id");
+				}
+			} else {
+
+			}
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while creating a folder:" + e.getMessage());
+			throw new Exception("Error occurred while creating a folder: " + e.getMessage());
+		}
+		return -1;
+	}
+
+	public static int[] getAllIntegrationGroupIds(String url, String username, String password, String paramString)
+			throws Exception {
+		LOGGER.debug("Getting all integration group ids.");
+		HashMap<String, String> parameters = new HashMap<>();
+		parameters.put(QUERY_KEY, paramString);
+		String responseBody = sendGetRequest(url + GRAPHQL_API, parameters, getCommonHeaders(url, username, password));
+		int[] integrationGroups = null;
+		try {
+			if (responseBody != null) {
+				try {
+					JSONObject responseObj = new JSONObject(responseBody).getJSONObject("integrationGroupList");
+					JSONArray groupList = responseObj.getJSONArray("list");
+					integrationGroups = new int[groupList.length()];
+					for (int i = 0; i < groupList.length(); ++i) {
+						integrationGroups[i] = groupList.getJSONObject(i).getInt("groupId");
+					}
+				} catch (JSONException jse) {
+					LOGGER.error("Error occurred while converting response to json object.");
+					// TODO: Exception should be thrown or not.
+				}
+			} else {
+				LOGGER.error("Error while getting integration group ids. Response is null");
+			}
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while getting all integration group ids. Caused by: " + e.getMessage());
+			throw new Exception("Error occurred while getting all integration group ids");
+		}
+		return integrationGroups;
+	}
+
+	private static HashMap<String, String> getCommonHeaders(String url, String username, String password)
+			throws Exception {
+		HashMap<String, String> headers = new HashMap<>();
+		String tokenValue = getXSRFToken(url, username, password);
+		String jsessionId = getJsessionId(url, username, password);
+		headers.put(X_XSRF_TOKEN, tokenValue);
+		headers.put(COOKIE_KEY, JSESSION_ID_KEY + "=" + jsessionId + "; " + XSRF_TOKEN + "=" + tokenValue);
+		return headers;
+	}
+
+	public static void activateReconciliation(String url, String username, String password, String requestBody)
+			throws Exception {
+		LOGGER.debug("Activating reconciliation");
+		String response = sendPutRequest(url + GRAPHQL_API, requestBody, getCommonHeaders(url, username, password));
+		// TODO: Log whether it is activated or not
+	}
+
+	public static int reconcileIntegration(String url, String username, String password, String requestBody)
+			throws Exception {
+		int reconcileId = -1;
+		HashMap<String, String> headers = getCommonHeaders(url, username, password);
+		headers.put(CONTENT_TYPE_KEY, APPLICATION_JSON);
+		String response = sendPostRequest(url + GRAPHQL_API, requestBody, getCommonHeaders(url, username, password),
+				APPLICATION_JSON);
+		if (response != null) {
+			try {
+				JSONObject jsonResponse = new JSONObject(response);
+				JSONArray reconcileResponse = jsonResponse.getJSONObject("reconciliationSchema")
+						.getJSONObject("response").getJSONArray("reconcileResponse");
+				reconcileId = reconcileResponse.getJSONObject(0).getInt("reconciliationId");
+				LOGGER.debug("Reconciliation created with id: " + reconcileId);
+			} catch (JSONException e) {
+				LOGGER.error("Error occurred while converting response string to json response. Caused by:"
+						+ e.getMessage());
+				// TODO: Exception should be thrown or not
+			}
+		} else {
+			LOGGER.error("Error occurred while creating reconciliation. Response:null");
+		}
+		return reconcileId;
+	}
+
+	public static Mapper getMappingDetailsForReconcile(String url, String username, String password, int mappingId)
+			throws Exception {
+		LOGGER.debug("Getting mapping details for reconciliation.");
+		HashMap<String, String> parameters = new HashMap<>();
+		String paramString = "{mapper(request:{parentId: -1, mappingId:" + mappingId
+				+ ", rulesConfigured:false}){response{mappingId,mappingName,validate,direction{direction},endpoint1{endpointId,mapperContext{key,value}},endpoint2{endpointId,mapperContext{key,value}},endpoint1Info{id,name,typeId,type,version,typeInternalName,parentTypeId},endpoint2Info{id,name,typeId,type,version,typeInternalName,parentTypeId},fields{backWardSettings{internalName,displayName,dataType,systemField,multiValued,syncWhen{syncWhen},defaultValue,overwrite,advanceXSL,reconcileRule{forCreate,forUpdate,mismatchStrategy,advancedTransformation,soruceFieldName},lookups{value,valueDisplayName,associatedValue,associatedValueDisplayName,direction{direction}},lookupId,oleObjectMapped,pictureObjectMapped,syncReferenceOfOleFile,fieldsUsed,customResolutionScript},forwardSettings{internalName,displayName,dataType,systemField,multiValued,syncWhen{syncWhen},defaultValue,overwrite,advanceXSL,reconcileRule{forCreate,forUpdate,mismatchStrategy,advancedTransformation,soruceFieldName},lookups{value,valueDisplayName,associatedValue,associatedValueDisplayName,direction{direction}},lookupId,oleObjectMapped,pictureObjectMapped,syncReferenceOfOleFile,fieldsUsed,customResolutionScript},direction{direction},conflictStrategy{conflictStrategy}},commentsConfig{enabled{direction},settings{settingType{setting},direction{direction}},forwardAdvanceXSL,backwardAdvanceXSL,commentTypeMapping{value,valueDisplayName,associatedValue,associatedValueDisplayName,direction{direction}},fieldsForCommentBody{key,value}},attachmentsConfig{enabled{direction},settings{settingType{setting},direction{direction}},forwardAdvanceXSL,backwardAdvanceXSL,attachmentTypeMapping{value,valueDisplayName,associatedValue,associatedValueDisplayName,direction{direction}}},validationResult{endPoint1Name,endPoint2Name ,invalidFieldsData{key,invalidFields},invalidEnumsData{endPoint1FieldDisplayName,endPoint2FieldDisplayName,missingEndPoint1Enum,invalidEnums},confirmRuleDelete},relationshipsConfig{enabled{direction}},rulesConfigured,parentId}}}";
+		parameters.put(QUERY_KEY, paramString);
+		String response = sendGetRequest(url + GRAPHQL_API, parameters, getCommonHeaders(url, username, password));
+
+		Mapper mapper = null;
+		if (response != null) {
+			JSONObject jsonObject = new JSONObject(response);
+			ObjectMapper mapperO = new ObjectMapper();
+			mapper = mapperO.readValue(
+					jsonObject.getJSONObject("mapper").getJSONArray("response").getJSONObject(0).toString(),
+					Mapper.class);
+		} else {
+			LOGGER.debug("Response is null while getting mapping details for reconciliation.");
+		}
+		return mapper;
+	}
+
+	public static void saveReconcileRules(String url, String username, String password, String requestBody)
+			throws Exception {
+		LOGGER.debug("Saving reconcilation rules");
+		HashMap<String, String> headers = getCommonHeaders(url, username, password);
+		headers.put(CONTENT_TYPE_KEY, APPLICATION_JSON);
+		sendPutRequest(url + GRAPHQL_API, requestBody, headers);
+	}
+
+	public static JSONObject getIntegrationDetailsByGroupId(String url, String username, String password,
+			String paramString) throws Exception {
+		HashMap<String, String> parameters = new HashMap<>();
+		parameters.put(QUERY_KEY, paramString);
+		String response = sendGetRequest(url + GRAPHQL_API, parameters, getCommonHeaders(url, username, password));
+		JSONObject jsonResponse = null;
+		if (response != null) {
+			jsonResponse = new JSONObject(response);
+		} else {
+			LOGGER.debug("Recevied response: " + response);
+		}
+		return jsonResponse;
+	}
+
+	public static int getFolderIdByName(String url, String folderName, int parentId, String username, String password) {
+		LOGGER.debug("Fetching folder id from name: " + folderName);
+		int id = -1;
+		try {
+			HashMap<String, String> headers = getCommonHeaders(url, username, password);
+			HashMap<String, String> parameters = new HashMap<>();
+			parameters.put(QUERY_KEY, "query{containers(id:" + parentId
+					+ "){id,name,entityType,integrationItems{id,name,entityType,hasChildren}}}");
+			String responseString = sendGetRequest(url + GRAPHQL_API, parameters, headers);
+			if (responseString != null) {
+				try {
+					JSONObject responseJSON = new JSONObject(responseString);
+					JSONArray array = responseJSON.getJSONObject("containers").getJSONArray("integrationItems");
+					for (int i = 0; i < array.length(); ++i) {
+						String foundFolderName = array.getJSONObject(i).getString("name");
+						if (foundFolderName.equalsIgnoreCase(folderName)) {
+							id = array.getJSONObject(i).getInt("id");
+						}
+					}
+				} catch (JSONException jse) {
+					LOGGER.error("Error occurred while converting/reading response to json object. Caused By:"
+							+ jse.getMessage());
+				}
+			} else {
+				LOGGER.debug("Response recevied: " + responseString);
+			}
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while getting folder name from URL. Caused by:" + e.getMessage());
+		}
+		return id;
+	}
+
+	public static String sendPostRequest(final String url, final String requestBody,
+			final HashMap<String, String> headers, String contentType) {
+		LOGGER.debug("Sending POST request.");
+		HttpResponse response = null;
+		HttpPost httpPost = null;
+		String responseString = null;
+		try {
+			LOGGER.debug("URL:" + (url));
+			LOGGER.debug("Request body:" + requestBody);
+			LOGGER.debug("Content-Type:" + contentType);
+			LOGGER.debug("Headers:" + headers.toString());
+			URIBuilder builder = new URIBuilder(url);
+			httpPost = new HttpPost(builder.build());
+			for (Map.Entry<String, String> entry : headers.entrySet()) {
+				httpPost.setHeader(entry.getKey(), entry.getValue());
+			}
+			StringEntity entity = new StringEntity(requestBody);
+			entity.setContentType(contentType);
+			httpPost.setEntity(entity);
+			response = httpClient.execute(httpPost);
+			if (response != null) {
+				LOGGER.debug("Response Code:" + response.getStatusLine().getStatusCode());
+				HttpEntity httpEntity = response.getEntity();
+				if (httpEntity != null && response.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
+					responseString = EntityUtils.toString(httpEntity);
+					LOGGER.debug("Response String:" + responseString);
+				} else {
+					LOGGER.debug("Entity in response is empty");
+				}
+			} else {
+				LOGGER.debug("Response is null");
+			}
+		} catch (Exception e) {
+			LOGGER.debug("Error occurred while sending POST request. Caused by:" + e.getMessage());
+		} finally {
+			if (httpPost != null) {
+				httpPost.releaseConnection();
+			}
+		}
+		return responseString;
+	}
+
+	private static void setHeader(final HttpRequest httpRequest, final HashMap<String, String> headers) {
+		if (headers != null && !headers.isEmpty()) {
+			for (Map.Entry<String, String> entry : headers.entrySet()) {
+				httpRequest.setHeader(entry.getKey(), entry.getValue());
+			}
+		}
+	}
+
+	private static void setParameters(final URIBuilder uriBuilder, final HashMap<String, String> params) {
+		if (params != null && !params.isEmpty()) {
+			for (Map.Entry<String, String> entry : params.entrySet()) {
+				uriBuilder.setParameter(entry.getKey(), entry.getValue());
+			}
+		}
+
+	}
+
+	public static String sendPutRequest(final String url, final String requestBody,
+			final HashMap<String, String> headers) {
+		LOGGER.debug("Sending PUT request:" + (url));
+		LOGGER.debug("Request body:" + requestBody);
+		LOGGER.debug("Headers:" + headers.toString());
+		HttpResponse response = null;
+		HttpPut httpPut = null;
+		String responseBody = null;
+		try {
+			httpPut = new HttpPut(url);
+			setHeader(httpPut, headers);
+			StringEntity entity = new StringEntity(requestBody);
+			entity.setContentType(APPLICATION_JSON);
+			httpPut.setEntity(entity);
+			response = httpClient.execute(httpPut);
+			if (response != null) {
+				LOGGER.debug("Response Code:" + response.getStatusLine().getStatusCode());
+				if (response.getEntity() != null) {
+					responseBody = EntityUtils.toString(entity);
+					LOGGER.debug("Response Body:" + responseBody);
+				} else {
+					LOGGER.debug("HttpEntity is null in response");
+				}
+			} else {
+				LOGGER.debug("Response:" + response);
+			}
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while sending PUT request. Caused by:" + e.getMessage());
+		} finally {
+			if (httpPut != null) {
+				httpPut.releaseConnection();
+			}
+		}
+		return responseBody;
+	}
+
+	public static String sendGetRequest(final String url, final HashMap<String, String> parameters,
+			final HashMap<String, String> headers) {
+		LOGGER.debug("Sending GET request. URL:" + url);
+		LOGGER.debug("Query Parameter String:" + ((parameters != null) ? parameters.toString() : "null"));
+		LOGGER.debug("Headers: " + ((headers != null) ? headers.toString() : "null"));
+		HttpResponse response = null;
+		HttpGet httpGet = null;
+		String responseString = null;
+		try {
+			URIBuilder builder = new URIBuilder(url);
+			setParameters(builder, parameters);
+			httpGet = new HttpGet(builder.build());
+			setHeader(httpGet, headers);
+			response = httpClient.execute(httpGet);
+			if (response != null) {
+				LOGGER.debug("Response Code:" + response.getStatusLine().getStatusCode());
+				HttpEntity httpEntity = response.getEntity();
+				if (httpEntity == null) {
+					LOGGER.debug("HttpEntity in response is null");
+				} else {
+					responseString = EntityUtils.toString(httpEntity);
+					LOGGER.debug("Response Body:" + responseString);
+				}
+			} else {
+				LOGGER.debug("Response is null");
+			}
+		} catch (Exception e) {
+			LOGGER.error("Error occurred while sending GET request. Caused By:" + e.getMessage());
+		} finally {
+			if (httpGet != null) {
+				httpGet.releaseConnection();
+			}
+		}
+		return responseString;
+	}
+
+	public static HashMap<String, String> getCachedSourceProjectIssueTypes(final String projectInternalId) {
+		return projectIssueTypeMap.get(projectInternalId);
+	}
+
+}
