@@ -43,11 +43,4 @@ public class Layer3 {
 		}
 	}
 
-	public static void createAndActiveReconciliation(HashMap<String, String> deploymentProperties) throws Exception {
-		String url = deploymentProperties.get(URL);
-		String username = deploymentProperties.get(USERNAME);
-		String password = deploymentProperties.get(PASSWORD);
-		Layer2.createReconciliation(url, username, password);
-	}
-
 }
