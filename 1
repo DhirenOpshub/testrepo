@@ -530,22 +530,7 @@ public class Layer1 {
 		return issueTypeIds;
 	}
 
-	public static String createIntegration(String createIntegrationUrl, String username, String password,
-			String requestBody) {
-		String response = null;
-		LOGGER.debug("Sending create integration request.");
-		try {
-			long startTime = System.currentTimeMillis();
-			response = sendPostRequest(createIntegrationUrl + GRAPHQL_API, requestBody,
-					getCommonHeaders(createIntegrationUrl, username, password), APPLICATION_JSON);
-			long endTime = System.currentTimeMillis();
-			LOGGER.debug("Time Taken: " + (endTime - startTime) + " ms");
-
-		} catch (Exception e) {
-			LOGGER.error("Exception occurred while creating integration. Caused By:" + e.getMessage());
-		}
-		return response;
-	}
+	
 
 	public static int createFolder(String url, String folderName, int parentId, String username, String password)
 			throws Exception {
@@ -574,35 +559,7 @@ public class Layer1 {
 		return -1;
 	}
 
-	public static int[] getAllIntegrationGroupIds(String url, String username, String password, String paramString)
-			throws Exception {
-		LOGGER.debug("Getting all integration group ids.");
-		HashMap<String, String> parameters = new HashMap<>();
-		parameters.put(QUERY_KEY, paramString);
-		String responseBody = sendGetRequest(url + GRAPHQL_API, parameters, getCommonHeaders(url, username, password));
-		int[] integrationGroups = null;
-		try {
-			if (responseBody != null) {
-				try {
-					JSONObject responseObj = new JSONObject(responseBody).getJSONObject("integrationGroupList");
-					JSONArray groupList = responseObj.getJSONArray("list");
-					integrationGroups = new int[groupList.length()];
-					for (int i = 0; i < groupList.length(); ++i) {
-						integrationGroups[i] = groupList.getJSONObject(i).getInt("groupId");
-					}
-				} catch (JSONException jse) {
-					LOGGER.error("Error occurred while converting response to json object.");
-					// TODO: Exception should be thrown or not.
-				}
-			} else {
-				LOGGER.error("Error while getting integration group ids. Response is null");
-			}
-		} catch (Exception e) {
-			LOGGER.error("Error occurred while getting all integration group ids. Caused by: " + e.getMessage());
-			throw new Exception("Error occurred while getting all integration group ids");
-		}
-		return integrationGroups;
-	}
+	
 
 	private static HashMap<String, String> getCommonHeaders(String url, String username, String password)
 			throws Exception {
@@ -676,19 +633,7 @@ public class Layer1 {
 		sendPutRequest(url + GRAPHQL_API, requestBody, headers);
 	}
 
-	public static JSONObject getIntegrationDetailsByGroupId(String url, String username, String password,
-			String paramString) throws Exception {
-		HashMap<String, String> parameters = new HashMap<>();
-		parameters.put(QUERY_KEY, paramString);
-		String response = sendGetRequest(url + GRAPHQL_API, parameters, getCommonHeaders(url, username, password));
-		JSONObject jsonResponse = null;
-		if (response != null) {
-			jsonResponse = new JSONObject(response);
-		} else {
-			LOGGER.debug("Recevied response: " + response);
-		}
-		return jsonResponse;
-	}
+	
 
 	public static int getFolderIdByName(String url, String folderName, int parentId, String username, String password) {
 		LOGGER.debug("Fetching folder id from name: " + folderName);
