@@ -1,0 +1,53 @@
+package layer3;
+
+import java.util.HashMap;
+import java.util.List;
+
+import org.apache.log4j.Logger;
+
+import layer2.Layer2;
+import layer4.ExcelInfo;
+
+public class Layer3 {
+
+	private static final String USERNAME = "username";
+	private static final String PASSWORD = "password";
+	private static final String URL = "url";
+
+	private static final Logger LOGGER = Logger.getLogger(Layer3.class);
+
+	public static void validateProjectsAndCreateIntegration(List<ExcelInfo> excelSourceTargetProjectMap,
+			HashMap<String, String> deploymentProperties, int totalProds, int currentPod, boolean validateOnlyProjects,
+			boolean throwException) throws Exception {
+		LOGGER.debug("Validating projects mentioned in the excel for POD:" + currentPod);
+		String url = deploymentProperties.get(URL);
+		String username = deploymentProperties.get(USERNAME);
+		String password = deploymentProperties.get(PASSWORD);
+		boolean areAllProjectsValid = Layer2.validateExcelProjects(excelSourceTargetProjectMap, url, username, password,
+				currentPod);
+	// boolean areAllProjectsValid = true;
+		LOGGER.debug("Validation of projects is complete for POD:" + currentPod);
+		if (!areAllProjectsValid) {
+			LOGGER.error("All projects mentioned in the excel sheet are not valid for POD:" + currentPod
+					+ ". Please check logs for more information");
+			if (throwException) {
+				throw new Exception("All projects mentioned in the excel are not valid");
+			}
+		} else {
+			LOGGER.debug("All projects are valid for POD:" + currentPod + " in the excel");
+			if (validateOnlyProjects) {
+				LOGGER.debug("Validate Only Project is enabled. Hence not creating integration.");
+				return;
+			}
+			Layer2.createIntegration(excelSourceTargetProjectMap, url, username, password, totalProds, currentPod);
+		}
+	}
+
+	public static void createAndActiveReconciliation(HashMap<String, String> deploymentProperties) throws Exception {
+		String url = deploymentProperties.get(URL);
+		String username = deploymentProperties.get(USERNAME);
+		String password = deploymentProperties.get(PASSWORD);
+		Layer2.createReconciliation(url, username, password);
+	}
+
+}
